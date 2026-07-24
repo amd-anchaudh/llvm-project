@@ -9,6 +9,7 @@
 #include "handlers.h"
 
 #include "amdgpu-formats.h" // SIInstrFlags
+#include "fp8-convert.h"
 #include "opcode-map.h"
 #include "canonical-op.h"
 #include "Utils/AMDGPUBaseInfo.h" // AMDGPU::getNamedOperandIdx, AMDGPU::OpName
@@ -177,6 +178,47 @@ HandlerResult handleMFMA(RaiseContext &Ctx, const DecodedInst &Di,
   Value *A = Ctx.Regs.readRegVec(Ctx.B, SrcA, SrcTy);
   Value *B = Ctx.Regs.readRegVec(Ctx.B, SrcB, SrcTy);
   Value *C = Ctx.Regs.readRegVec(Ctx.B, SrcC, AccumTy);
+
+  // Classify the fp8/bf8 MFMA operands: returns {AIsBf8, BIsBf8} for the
+  // fp8/bf8 MFMA family (which of A and B is bf8 vs fp8, needed to pick the
+  // right byte-lane re-encoder below), or nullopt for any other MFMA opcode
+  // (no fp8 operand re-encode applies).
+  auto fp8Sides = [&]() -> std::optional<std::pair<bool, bool>> {
+    switch (Sop) {
+    case CanonicalOp::V_MFMA_F32_16x16x32_FP8_FP8:
+    case CanonicalOp::V_MFMA_F32_32x32x16_FP8_FP8:
+      return std::pair{false, false};
+    case CanonicalOp::V_MFMA_F32_16x16x32_FP8_BF8:
+    case CanonicalOp::V_MFMA_F32_32x32x16_FP8_BF8:
+      return std::pair{false, true};
+    case CanonicalOp::V_MFMA_F32_16x16x32_BF8_FP8:
+    case CanonicalOp::V_MFMA_F32_32x32x16_BF8_FP8:
+      return std::pair{true, false};
+    case CanonicalOp::V_MFMA_F32_16x16x32_BF8_BF8:
+    case CanonicalOp::V_MFMA_F32_32x32x16_BF8_BF8:
+      return std::pair{true, true};
+    default:
+      return std::nullopt;
+    }
+  }();
+  auto ToFnuz = fp8Reencode(Ctx.Isa, Ctx.TargetIsa, Fp8Dir::SrcToTgt);
+  if (fp8Sides && ToFnuz) {
+    auto [AIsBf8, BIsBf8] = *fp8Sides;
+    assert(SrcTy->isIntegerTy(64) && "fp8 MFMA operand expected i64");
+    auto Conv = [&](Value *V, bool IsBf8) -> Value * {
+      Value *Lo = Ctx.B.CreateTrunc(V, Ctx.I32Ty);
+      Value *Hi = Ctx.B.CreateTrunc(
+          Ctx.B.CreateLShr(V, ConstantInt::get(SrcTy, 32)), Ctx.I32Ty);
+      Lo = convertFp8Dword(Ctx.B, Lo, IsBf8, *ToFnuz);
+      Hi = convertFp8Dword(Ctx.B, Hi, IsBf8, *ToFnuz);
+      return Ctx.B.CreateOr(
+          Ctx.B.CreateZExt(Lo, SrcTy),
+          Ctx.B.CreateShl(Ctx.B.CreateZExt(Hi, SrcTy),
+                          ConstantInt::get(SrcTy, 32)));
+    };
+    A = Conv(A, AIsBf8);
+    B = Conv(B, BIsBf8);
+  }
 
   // Immediate modifiers keyed off the authoritative named-operand table.
   // `cbsz` is common to both families; `abid` is non-scaled only; scaled

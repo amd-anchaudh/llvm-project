@@ -9,6 +9,7 @@
 #include "handle-valu-internal.h"
 #include "handle-valu-f16-utils.h"
 #include "handle-valu-output-mods.h"
+#include "fp8-convert.h"
 #include "handlers.h"
 #include "opcode-map.h"
 
@@ -556,6 +557,32 @@ static llvm::Value *emitCvtScalePk8Bf16Fp4CrossTargetExpansion(
                                  "mxfp4_vec_insert");
   }
   return Vec;
+}
+
+// Emit v_cvt_pk_{fp8,bf8}_f32: pack two f32 into two fp8 bytes at the WordSel
+// half of OldVal. When source/target fp8 formats differ, the hw encode (which
+// produces TARGET-format bytes) is run in isolation, re-encoded TGT->SRC, then
+// merged into OldVal's SRC-format bytes at the selected half (so the preserved
+// half stays in the source format).
+llvm::Value *emitCvtPkFp8F32(RaiseContext &Ctx, llvm::Function *CvtFn,
+                             llvm::Value *S0, llvm::Value *S1,
+                             llvm::Value *OldVal, bool WordSel, bool IsBf8) {
+  auto &B = Ctx.B;
+  auto ToFnuz = fp8Reencode(Ctx.Isa, Ctx.TargetIsa, Fp8Dir::TgtToSrc);
+  if (!ToFnuz)
+    return B.CreateCall(
+        CvtFn, {S0, S1, OldVal, ConstantInt::get(Ctx.I1Ty, WordSel)}, "pk_fp8");
+  Value *Fresh = B.CreateCall(CvtFn,
+                              {S0, S1, ConstantInt::get(Ctx.I32Ty, 0),
+                               ConstantInt::get(Ctx.I1Ty, false)},
+                              "pk_fp8_raw");
+  Fresh = convertFp8Dword(B, Fresh, IsBf8, *ToFnuz);
+  Value *Lo = B.CreateAnd(Fresh, ConstantInt::get(Ctx.I32Ty, 0xFFFF));
+  if (WordSel)
+    return B.CreateOr(B.CreateAnd(OldVal, ConstantInt::get(Ctx.I32Ty, 0xFFFF)),
+                      B.CreateShl(Lo, ConstantInt::get(Ctx.I32Ty, 16)));
+  return B.CreateOr(
+      B.CreateAnd(OldVal, ConstantInt::get(Ctx.I32Ty, 0xFFFF0000)), Lo);
 }
 
 } // namespace
@@ -2699,6 +2726,11 @@ HandlerResult handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
           {ExtractF(6), ExtractF(7), Dw1Lo,
            ConstantInt::get(Ctx.I1Ty, 1)},
           "pk_fp8_67");
+      if (auto ToFnuz =
+              fp8Reencode(Ctx.Isa, Ctx.TargetIsa, Fp8Dir::TgtToSrc)) {
+        Dw0 = convertFp8Dword(Ctx.B, Dw0, /*IsBf8=*/false, *ToFnuz);
+        Dw1 = convertFp8Dword(Ctx.B, Dw1, /*IsBf8=*/false, *ToFnuz);
+      }
       auto *V2I32Ty = FixedVectorType::get(Ctx.I32Ty, 2);
       Value *Packed = PoisonValue::get(V2I32Ty);
       Packed = Ctx.B.CreateInsertElement(Packed, Dw0, (uint64_t)0);
@@ -2727,8 +2759,9 @@ HandlerResult handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
     Value *OldVal = (Op.nSrcs() >= 3) ? Op.src(2) : ConstantInt::get(Ctx.I32Ty, 0);
     bool WordSel = (Op.nSrcs() >= 4 && Di.isImm(Op.srcIdx(3))) ? (Op.srcImm(3) != 0) : false;
     Function *CvtFn = Intrinsic::getOrInsertDeclaration(&Ctx.M, Intrinsic::amdgcn_cvt_pk_fp8_f32);
-    Ctx.writeReg32(Op.dst(), Ctx.B.CreateCall(CvtFn,
-        {S0, S1, OldVal, ConstantInt::get(Ctx.I1Ty, WordSel)}, "pk_fp8"));
+    Ctx.writeReg32(Op.dst(),
+                   emitCvtPkFp8F32(Ctx, CvtFn, S0, S1, OldVal, WordSel,
+                                   /*IsBf8=*/false));
     Hr.Handled = true;
     return Hr;
   }
@@ -2739,8 +2772,9 @@ HandlerResult handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
     Value *OldVal = (Op.nSrcs() >= 3) ? Op.src(2) : ConstantInt::get(Ctx.I32Ty, 0);
     bool WordSel = (Op.nSrcs() >= 4 && Di.isImm(Op.srcIdx(3))) ? (Op.srcImm(3) != 0) : false;
     Function *CvtFn = Intrinsic::getOrInsertDeclaration(&Ctx.M, Intrinsic::amdgcn_cvt_pk_bf8_f32);
-    Ctx.writeReg32(Op.dst(), Ctx.B.CreateCall(CvtFn,
-        {S0, S1, OldVal, ConstantInt::get(Ctx.I1Ty, WordSel)}, "pk_bf8"));
+    Ctx.writeReg32(Op.dst(),
+                   emitCvtPkFp8F32(Ctx, CvtFn, S0, S1, OldVal, WordSel,
+                                   /*IsBf8=*/true));
     Hr.Handled = true;
     return Hr;
   }
@@ -2783,6 +2817,9 @@ HandlerResult handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
     Value *Src = Op.src(0);
     if (Src->getType() != Ctx.I32Ty)
       Src = Ctx.B.CreateBitOrPointerCast(Src, Ctx.I32Ty);
+    if (auto ToFnuz = fp8Reencode(Ctx.Isa, Ctx.TargetIsa, Fp8Dir::SrcToTgt))
+      Src = convertFp8Dword(Ctx.B, Src, Sop == CanonicalOp::V_CVT_PK_F32_BF8,
+                            *ToFnuz);
     Intrinsic::ID Iid = (Sop == CanonicalOp::V_CVT_PK_F32_FP8)
                             ? Intrinsic::amdgcn_cvt_pk_f32_fp8
                             : Intrinsic::amdgcn_cvt_pk_f32_bf8;
@@ -2814,6 +2851,9 @@ HandlerResult handleVALU(RaiseContext &Ctx, const DecodedInst &Di,
     Value *Src = Op.src(0);
     if (Src->getType() != Ctx.I32Ty)
       Src = Ctx.B.CreateBitOrPointerCast(Src, Ctx.I32Ty);
+    if (auto ToFnuz = fp8Reencode(Ctx.Isa, Ctx.TargetIsa, Fp8Dir::SrcToTgt))
+      Src = convertFp8Dword(Ctx.B, Src, Sop == CanonicalOp::V_CVT_F32_BF8,
+                            *ToFnuz);
     Intrinsic::ID Iid = (Sop == CanonicalOp::V_CVT_F32_FP8)
                             ? Intrinsic::amdgcn_cvt_f32_fp8
                             : Intrinsic::amdgcn_cvt_f32_bf8;
